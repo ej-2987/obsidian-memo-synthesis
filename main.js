@@ -64,7 +64,10 @@ class MemoSuggesterModal extends obsidian.FuzzySuggestModal {
     }
 
     onClose() {
-        if (!this._chosen && this._resolve) { this._resolve(null); this._resolve = null; }
+        // Obsidian calls close() BEFORE onChooseItem, so delay to let onChooseItem fire first
+        setTimeout(() => {
+            if (!this._chosen && this._resolve) { this._resolve(null); this._resolve = null; }
+        }, 50);
     }
 
     wait() {
