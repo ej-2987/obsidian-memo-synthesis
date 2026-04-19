@@ -14,6 +14,8 @@ const DEFAULT_SETTINGS = {
     claudeModel: 'claude-sonnet-4-6',
     perplexityApiKey: '',
     perplexityModel: 'sonar',
+    openaiApiKey: '',
+    openaiModel: 'gpt-4o',
 };
 
 const MODELS = {
@@ -35,10 +37,16 @@ const MODELS = {
         { id: 'sonar-reasoning-pro', name: 'Sonar Reasoning Pro' },
         { id: 'sonar-reasoning', name: 'Sonar Reasoning' },
     ],
+    openai: [
+        { id: 'gpt-4o', name: 'GPT-4o (추천)' },
+        { id: 'gpt-4o-mini', name: 'GPT-4o Mini (빠름)' },
+        { id: 'gpt-4-turbo', name: 'GPT-4 Turbo' },
+        { id: 'gpt-3.5-turbo', name: 'GPT-3.5 Turbo' },
+    ],
 };
 
 // ──────────────────────────────────────────────
-// MODALS
+// MODAL: 트리거/형식 선택용 (FuzzySuggest)
 // ──────────────────────────────────────────────
 
 class MemoSuggesterModal extends obsidian.FuzzySuggestModal {
@@ -64,7 +72,7 @@ class MemoSuggesterModal extends obsidian.FuzzySuggestModal {
     }
 
     onClose() {
-        // Obsidian calls close() BEFORE onChooseItem, so delay to let onChooseItem fire first
+        // Obsidian calls close() BEFORE onChooseItem — delay to let onChooseItem fire first
         setTimeout(() => {
             if (!this._chosen && this._resolve) { this._resolve(null); this._resolve = null; }
         }, 50);
@@ -74,6 +82,10 @@ class MemoSuggesterModal extends obsidian.FuzzySuggestModal {
         return new Promise(r => { this._resolve = r; this.open(); });
     }
 }
+
+// ──────────────────────────────────────────────
+// MODAL: 텍스트 입력
+// ──────────────────────────────────────────────
 
 class MemoPromptModal extends obsidian.Modal {
     constructor(app, title, placeholder, defaultVal) {
@@ -129,90 +141,412 @@ class MemoPromptModal extends obsidian.Modal {
     }
 }
 
-class MemoMultiSelectModal extends obsidian.Modal {
-    constructor(app, items, title) {
+// ──────────────────────────────────────────────
+// MODAL: 메모 선택 (검색 + 폴더 트리)
+// multi=true  → TFile[] 반환
+// multi=false → TFile  반환 (클릭하면 바로 선택)
+// ──────────────────────────────────────────────
+
+class MemoPickerModal extends obsidian.Modal {
+    constructor(app, files, title, multi = true) {
         super(app);
-        this._items = items;
+        this._allFiles = files;        // TFile[]
         this._title = title;
-        this._selected = new Set();
+        this._multi = multi;
+        this._selected = new Set();    // file.path
         this._resolve = null;
         this._done = false;
+        this._searchTerm = '';
+        this._listEl = null;
+        this._expanded = {};           // folderPath → bool (기본 true)
     }
 
     onOpen() {
         const { contentEl } = this;
-        contentEl.createEl('h3', { text: this._title });
+        Object.assign(contentEl.style, { padding: '16px', minWidth: '480px' });
 
-        const hint = contentEl.createEl('p', { text: '체크박스로 여러 개 선택 후 확인 버튼을 누르세요.' });
-        Object.assign(hint.style, { color: 'var(--text-muted)', fontSize: '0.85em', marginTop: '0' });
+        // 제목
+        const h = contentEl.createEl('h3', { text: this._title });
+        Object.assign(h.style, { marginTop: '0', marginBottom: '10px' });
 
-        const list = contentEl.createEl('div');
-        Object.assign(list.style, {
-            maxHeight: '380px', overflowY: 'auto',
-            border: '1px solid var(--background-modifier-border)',
-            borderRadius: '6px', padding: '4px', marginBottom: '12px',
+        // 검색창
+        const searchInput = contentEl.createEl('input');
+        Object.assign(searchInput, { type: 'text', placeholder: '🔍 메모 제목으로 검색...' });
+        Object.assign(searchInput.style, {
+            width: '100%', padding: '8px 12px', boxSizing: 'border-box',
+            borderRadius: '6px', border: '1px solid var(--background-modifier-border)',
+            fontSize: 'var(--font-ui-medium)', background: 'var(--background-primary)',
+            marginBottom: '8px',
         });
 
-        for (const item of this._items) {
-            const key = item.file ? item.file.path : '';
-            const label = list.createEl('label');
-            Object.assign(label.style, {
-                display: 'flex', alignItems: 'center', padding: '6px 10px',
-                cursor: 'pointer', borderRadius: '4px', gap: '8px',
+        // 리스트 영역
+        this._listEl = contentEl.createEl('div');
+        Object.assign(this._listEl.style, {
+            maxHeight: '420px', overflowY: 'auto',
+            border: '1px solid var(--background-modifier-border)',
+            borderRadius: '6px', padding: '4px', marginBottom: '10px',
+        });
+
+        this._renderList();
+
+        searchInput.addEventListener('input', e => {
+            this._searchTerm = e.target.value.trim().toLowerCase();
+            this._renderList();
+        });
+
+        setTimeout(() => searchInput.focus(), 10);
+
+        // 버튼
+        if (this._multi) {
+            const footer = contentEl.createEl('div');
+            Object.assign(footer.style, { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+            const ok = footer.createEl('button', { text: '확인', cls: 'mod-cta' });
+            const cancel = footer.createEl('button', { text: '취소' });
+            ok.addEventListener('click', () => {
+                this._finish(this._allFiles.filter(f => this._selected.has(f.path)));
             });
-
-            label.addEventListener('mouseenter', () => {
-                if (!this._selected.has(key)) label.style.background = 'var(--background-modifier-hover)';
+            cancel.addEventListener('click', () => this._finish([]));
+        } else {
+            const hint = contentEl.createEl('p', { text: '메모를 클릭하면 바로 선택됩니다.' });
+            Object.assign(hint.style, {
+                color: 'var(--text-muted)', fontSize: '0.82em', margin: '0', textAlign: 'right',
             });
-            label.addEventListener('mouseleave', () => {
-                label.style.background = this._selected.has(key)
-                    ? 'var(--interactive-accent-hover)' : 'transparent';
+        }
+    }
+
+    _finish(result) {
+        if (this._done) return;
+        this._done = true;
+        if (this._resolve) { this._resolve(result); this._resolve = null; }
+        this.close();
+    }
+
+    _renderList() {
+        this._listEl.empty();
+        if (this._searchTerm) {
+            this._renderSearchResults();
+        } else {
+            this._renderFolderTree();
+        }
+    }
+
+    // ── 검색 결과: 평면 리스트 + 소속 폴더 표시 ────────────
+
+    _renderSearchResults() {
+        const filtered = this._allFiles.filter(f =>
+            f.basename.toLowerCase().includes(this._searchTerm)
+        );
+
+        if (!filtered.length) {
+            const empty = this._listEl.createEl('div', { text: '검색 결과가 없습니다.' });
+            Object.assign(empty.style, {
+                padding: '20px', textAlign: 'center', color: 'var(--text-muted)',
             });
+            return;
+        }
 
-            const cb = label.createEl('input');
-            cb.type = 'checkbox';
-            cb.style.cursor = 'pointer';
-            cb.style.flexShrink = '0';
+        for (const file of filtered) {
+            this._renderFileRow(this._listEl, file, 0, true);
+        }
+    }
 
-            const nameEl = label.createEl('span');
-            nameEl.style.flex = '1';
+    // ── 폴더 트리 ────────────────────────────────────────
 
-            if (item.score !== undefined && item.score > 0) {
-                const scoreSpan = nameEl.createEl('span', { text: `[${item.score}점] ` });
-                Object.assign(scoreSpan.style, {
-                    color: 'var(--text-accent)', fontSize: '0.8em', marginRight: '4px',
-                });
+    _buildTree(files) {
+        const root = { files: [], children: {} };
+        for (const file of files) {
+            const parts = file.path.split('/');
+            parts.pop(); // 파일명 제거
+            let node = root;
+            let cur = '';
+            for (const part of parts) {
+                cur = cur ? `${cur}/${part}` : part;
+                if (!node.children[part]) {
+                    node.children[part] = { name: part, path: cur, files: [], children: {} };
+                }
+                node = node.children[part];
             }
-            nameEl.createEl('span', { text: item.file ? item.file.basename : '?' });
+            node.files.push(file);
+        }
+        return root;
+    }
 
-            cb.addEventListener('change', () => {
-                if (cb.checked) {
-                    this._selected.add(key);
-                    label.style.background = 'var(--interactive-accent-hover)';
-                } else {
-                    this._selected.delete(key);
-                    label.style.background = 'transparent';
+    _countAll(node) {
+        let n = node.files.length;
+        for (const c of Object.values(node.children)) n += this._countAll(c);
+        return n;
+    }
+
+    _renderFolderTree() {
+        const tree = this._buildTree(this._allFiles);
+        this._renderNode(this._listEl, tree, 0);
+    }
+
+    _renderNode(containerEl, node, depth) {
+        // 현재 레벨 파일 먼저
+        const sortedFiles = [...node.files].sort((a, b) => a.basename.localeCompare(b.basename));
+        for (const file of sortedFiles) {
+            this._renderFileRow(containerEl, file, depth, false);
+        }
+
+        // 하위 폴더
+        const sortedFolders = Object.values(node.children)
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        for (const child of sortedFolders) {
+            const isExpanded = this._expanded[child.path] !== false; // 기본 펼침
+
+            // 폴더 헤더
+            const folderRow = containerEl.createEl('div');
+            Object.assign(folderRow.style, {
+                display: 'flex', alignItems: 'center', cursor: 'pointer',
+                padding: `5px 8px 5px ${8 + depth * 18}px`,
+                borderRadius: '4px', userSelect: 'none',
+            });
+            folderRow.addEventListener('mouseenter', () => folderRow.style.background = 'var(--background-modifier-hover)');
+            folderRow.addEventListener('mouseleave', () => folderRow.style.background = 'transparent');
+
+            const arrow = folderRow.createEl('span');
+            Object.assign(arrow.style, {
+                fontSize: '0.7em', marginRight: '5px', width: '10px',
+                display: 'inline-block', color: 'var(--text-muted)',
+            });
+            arrow.textContent = isExpanded ? '▾' : '▸';
+
+            const folderName = folderRow.createEl('span', { text: '📁 ' + child.name });
+            folderName.style.fontWeight = '600';
+
+            const count = folderRow.createEl('span', { text: ` (${this._countAll(child)})` });
+            Object.assign(count.style, { color: 'var(--text-muted)', fontSize: '0.8em', marginLeft: '4px' });
+
+            // 폴더 내용 컨테이너
+            const childContainer = containerEl.createEl('div');
+            childContainer.style.display = isExpanded ? 'block' : 'none';
+
+            // 처음 한 번만 렌더링
+            if (isExpanded) this._renderNode(childContainer, child, depth + 1);
+            let rendered = isExpanded;
+
+            folderRow.addEventListener('click', () => {
+                const nowExpanded = this._expanded[child.path] !== false;
+                this._expanded[child.path] = !nowExpanded;
+                const opening = !nowExpanded;
+                childContainer.style.display = opening ? 'block' : 'none';
+                arrow.textContent = opening ? '▾' : '▸';
+                if (opening && !rendered) {
+                    this._renderNode(childContainer, child, depth + 1);
+                    rendered = true;
                 }
             });
         }
+    }
 
-        const btnRow = contentEl.createEl('div');
-        Object.assign(btnRow.style, { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+    // ── 파일 행 렌더링 ────────────────────────────────────
 
-        const ok = btnRow.createEl('button', { text: '확인', cls: 'mod-cta' });
-        const cancel = btnRow.createEl('button', { text: '취소' });
+    _renderFileRow(containerEl, file, depth, showPath) {
+        const isSelected = this._selected.has(file.path);
 
-        const finish = (result) => {
-            if (this._done) return;
-            this._done = true;
-            if (this._resolve) { this._resolve(result); this._resolve = null; }
-            this.close();
-        };
+        const row = containerEl.createEl('div');
+        Object.assign(row.style, {
+            display: 'flex', alignItems: 'center', cursor: 'pointer',
+            padding: `5px 10px 5px ${10 + depth * 18}px`,
+            borderRadius: '4px', gap: '8px',
+            background: isSelected ? 'var(--interactive-accent-hover)' : 'transparent',
+        });
+
+        row.addEventListener('mouseenter', () => {
+            if (!this._selected.has(file.path)) row.style.background = 'var(--background-modifier-hover)';
+        });
+        row.addEventListener('mouseleave', () => {
+            row.style.background = this._selected.has(file.path)
+                ? 'var(--interactive-accent-hover)' : 'transparent';
+        });
+
+        if (this._multi) {
+            const cb = row.createEl('input');
+            cb.type = 'checkbox';
+            cb.checked = isSelected;
+            Object.assign(cb.style, { flexShrink: '0', cursor: 'pointer', pointerEvents: 'none' });
+
+            const textWrap = row.createEl('div');
+            textWrap.style.flex = '1';
+            textWrap.createEl('div', { text: '📝 ' + file.basename });
+            if (showPath) {
+                const parts = file.path.split('/');
+                parts.pop();
+                if (parts.length) {
+                    const pathEl = textWrap.createEl('div', { text: '📁 ' + parts.join(' › ') });
+                    Object.assign(pathEl.style, { fontSize: '0.78em', color: 'var(--text-muted)' });
+                }
+            }
+
+            row.addEventListener('click', () => {
+                if (this._selected.has(file.path)) {
+                    this._selected.delete(file.path);
+                    cb.checked = false;
+                    row.style.background = 'transparent';
+                } else {
+                    this._selected.add(file.path);
+                    cb.checked = true;
+                    row.style.background = 'var(--interactive-accent-hover)';
+                }
+            });
+        } else {
+            const textWrap = row.createEl('div');
+            textWrap.style.flex = '1';
+            textWrap.createEl('div', { text: '📝 ' + file.basename });
+            if (showPath) {
+                const parts = file.path.split('/');
+                parts.pop();
+                if (parts.length) {
+                    const pathEl = textWrap.createEl('div', { text: '📁 ' + parts.join(' › ') });
+                    Object.assign(pathEl.style, { fontSize: '0.78em', color: 'var(--text-muted)' });
+                }
+            }
+            row.addEventListener('click', () => this._finish(file));
+        }
+    }
+
+    onClose() {
+        if (!this._done && this._resolve) {
+            this._resolve(this._multi ? [] : null);
+            this._resolve = null;
+        }
+        this.contentEl.empty();
+    }
+
+    wait() {
+        return new Promise(r => { this._resolve = r; this.open(); });
+    }
+}
+
+// ──────────────────────────────────────────────
+// MODAL: 검색 결과 점수 목록에서 선택
+// ──────────────────────────────────────────────
+
+class MemoScoreSelectModal extends obsidian.Modal {
+    constructor(app, scoredItems, title) {
+        super(app);
+        this._items = scoredItems;   // [{file, content, score}]
+        this._title = title;
+        this._selected = new Set();
+        this._resolve = null;
+        this._done = false;
+        this._searchTerm = '';
+    }
+
+    onOpen() {
+        const { contentEl } = this;
+        Object.assign(contentEl.style, { padding: '16px', minWidth: '460px' });
+
+        contentEl.createEl('h3', { text: this._title }).style.marginTop = '0';
+
+        const hint = contentEl.createEl('p', { text: '관련도 점수 기준 정렬. 체크 후 확인을 누르세요.' });
+        Object.assign(hint.style, { color: 'var(--text-muted)', fontSize: '0.83em', marginTop: '0' });
+
+        // 검색창
+        const searchInput = contentEl.createEl('input');
+        Object.assign(searchInput, { type: 'text', placeholder: '🔍 제목으로 필터...' });
+        Object.assign(searchInput.style, {
+            width: '100%', padding: '7px 10px', boxSizing: 'border-box',
+            borderRadius: '6px', border: '1px solid var(--background-modifier-border)',
+            fontSize: 'var(--font-ui-medium)', background: 'var(--background-primary)',
+            marginBottom: '8px',
+        });
+
+        this._listEl = contentEl.createEl('div');
+        Object.assign(this._listEl.style, {
+            maxHeight: '380px', overflowY: 'auto',
+            border: '1px solid var(--background-modifier-border)',
+            borderRadius: '6px', padding: '4px', marginBottom: '10px',
+        });
+        this._renderItems();
+
+        searchInput.addEventListener('input', e => {
+            this._searchTerm = e.target.value.trim().toLowerCase();
+            this._renderItems();
+        });
+
+        const footer = contentEl.createEl('div');
+        Object.assign(footer.style, { display: 'flex', gap: '8px', justifyContent: 'flex-end' });
+        const ok = footer.createEl('button', { text: '확인', cls: 'mod-cta' });
+        const cancel = footer.createEl('button', { text: '취소' });
 
         ok.addEventListener('click', () => {
-            finish(this._items.filter(item => this._selected.has(item.file ? item.file.path : '')));
+            this._finish(this._items.filter(item => this._selected.has(item.file.path)));
         });
-        cancel.addEventListener('click', () => finish([]));
+        cancel.addEventListener('click', () => this._finish([]));
+
+        setTimeout(() => searchInput.focus(), 10);
+    }
+
+    _renderItems() {
+        this._listEl.empty();
+        const filtered = this._searchTerm
+            ? this._items.filter(item => item.file.basename.toLowerCase().includes(this._searchTerm))
+            : this._items;
+
+        if (!filtered.length) {
+            this._listEl.createEl('div', { text: '결과 없음' }).style.cssText =
+                'padding:16px;text-align:center;color:var(--text-muted);';
+            return;
+        }
+
+        for (const item of filtered) {
+            const key = item.file.path;
+            const row = this._listEl.createEl('div');
+            Object.assign(row.style, {
+                display: 'flex', alignItems: 'center', cursor: 'pointer',
+                padding: '6px 10px', borderRadius: '4px', gap: '8px',
+                background: this._selected.has(key) ? 'var(--interactive-accent-hover)' : 'transparent',
+            });
+            row.addEventListener('mouseenter', () => {
+                if (!this._selected.has(key)) row.style.background = 'var(--background-modifier-hover)';
+            });
+            row.addEventListener('mouseleave', () => {
+                row.style.background = this._selected.has(key) ? 'var(--interactive-accent-hover)' : 'transparent';
+            });
+
+            const cb = row.createEl('input');
+            cb.type = 'checkbox';
+            cb.checked = this._selected.has(key);
+            Object.assign(cb.style, { flexShrink: '0', cursor: 'pointer', pointerEvents: 'none' });
+
+            const scoreEl = row.createEl('span', { text: `${item.score}점` });
+            Object.assign(scoreEl.style, {
+                color: 'var(--text-accent)', fontSize: '0.78em', fontWeight: '600',
+                minWidth: '36px', textAlign: 'right', flexShrink: '0',
+            });
+
+            const nameWrap = row.createEl('div');
+            nameWrap.style.flex = '1';
+            nameWrap.createEl('div', { text: item.file.basename });
+            const parts = item.file.path.split('/');
+            parts.pop();
+            if (parts.length) {
+                const p = nameWrap.createEl('div', { text: '📁 ' + parts.join(' › ') });
+                Object.assign(p.style, { fontSize: '0.76em', color: 'var(--text-muted)' });
+            }
+
+            row.addEventListener('click', () => {
+                if (this._selected.has(key)) {
+                    this._selected.delete(key);
+                    cb.checked = false;
+                    row.style.background = 'transparent';
+                } else {
+                    this._selected.add(key);
+                    cb.checked = true;
+                    row.style.background = 'var(--interactive-accent-hover)';
+                }
+            });
+        }
+    }
+
+    _finish(result) {
+        if (this._done) return;
+        this._done = true;
+        if (this._resolve) { this._resolve(result); this._resolve = null; }
+        this.close();
     }
 
     onClose() {
@@ -240,7 +574,6 @@ class MemoSynthesisSettingTab extends obsidian.PluginSettingTab {
         containerEl.empty();
         containerEl.createEl('h2', { text: '메모 통합 발전 설정' });
 
-        // ── 기본 AI 제공자
         new obsidian.Setting(containerEl)
             .setName('기본 AI 제공자')
             .setDesc('메모 발전에 사용할 AI API를 선택합니다.')
@@ -248,6 +581,7 @@ class MemoSynthesisSettingTab extends obsidian.PluginSettingTab {
                 .addOption('gemini', '🔵 Google Gemini')
                 .addOption('claude', '🟠 Anthropic Claude')
                 .addOption('perplexity', '🟣 Perplexity AI')
+                .addOption('openai', '🟢 OpenAI')
                 .setValue(this.plugin.settings.provider)
                 .onChange(async v => {
                     this.plugin.settings.provider = v;
@@ -257,69 +591,46 @@ class MemoSynthesisSettingTab extends obsidian.PluginSettingTab {
             );
 
         const p = this.plugin.settings.provider;
-        const providerLabel = { gemini: 'Gemini', claude: 'Claude', perplexity: 'Perplexity' }[p];
+        const pLabel = { gemini: 'Gemini', claude: 'Claude', perplexity: 'Perplexity', openai: 'OpenAI' }[p];
         containerEl.createEl('p', {
-            text: `현재 선택: ${providerLabel} — ${this.plugin.getCurrentModelName()}`,
+            text: `현재 선택: ${pLabel} — ${this.plugin.getCurrentModelName()}`,
         }).style.cssText = 'color:var(--text-accent);margin-top:-8px;font-size:0.9em;';
 
-        // ── Gemini
-        containerEl.createEl('h3', { text: '🔵 Google Gemini' });
+        this._section(containerEl, '🔵 Google Gemini', [
+            { name: 'Gemini API 키', desc: 'Google AI Studio에서 발급', key: 'geminiApiKey', placeholder: 'AIza...' },
+        ], 'geminiModel', MODELS.gemini);
 
-        new obsidian.Setting(containerEl)
-            .setName('Gemini API 키')
-            .setDesc('Google AI Studio에서 발급')
-            .addText(t => t
-                .setPlaceholder('AIza...')
-                .setValue(this.plugin.settings.geminiApiKey)
-                .onChange(async v => { this.plugin.settings.geminiApiKey = v.trim(); await this.plugin.saveSettings(); })
-            );
+        this._section(containerEl, '🟠 Anthropic Claude', [
+            { name: 'Claude API 키', desc: 'console.anthropic.com에서 발급', key: 'claudeApiKey', placeholder: 'sk-ant-...' },
+        ], 'claudeModel', MODELS.claude);
 
+        this._section(containerEl, '🟣 Perplexity AI', [
+            { name: 'Perplexity API 키', desc: 'perplexity.ai/settings/api에서 발급', key: 'perplexityApiKey', placeholder: 'pplx-...' },
+        ], 'perplexityModel', MODELS.perplexity);
+
+        this._section(containerEl, '🟢 OpenAI', [
+            { name: 'OpenAI API 키', desc: 'platform.openai.com에서 발급', key: 'openaiApiKey', placeholder: 'sk-...' },
+        ], 'openaiModel', MODELS.openai);
+    }
+
+    _section(containerEl, title, fields, modelKey, models) {
+        containerEl.createEl('h3', { text: title });
+        for (const f of fields) {
+            new obsidian.Setting(containerEl)
+                .setName(f.name)
+                .setDesc(f.desc)
+                .addText(t => t
+                    .setPlaceholder(f.placeholder)
+                    .setValue(this.plugin.settings[f.key])
+                    .onChange(async v => { this.plugin.settings[f.key] = v.trim(); await this.plugin.saveSettings(); })
+                );
+        }
         new obsidian.Setting(containerEl)
-            .setName('Gemini 모델')
+            .setName('모델')
             .addDropdown(dd => {
-                for (const m of MODELS.gemini) dd.addOption(m.id, m.name);
-                dd.setValue(this.plugin.settings.geminiModel)
-                  .onChange(async v => { this.plugin.settings.geminiModel = v; await this.plugin.saveSettings(); this.display(); });
-            });
-
-        // ── Claude
-        containerEl.createEl('h3', { text: '🟠 Anthropic Claude' });
-
-        new obsidian.Setting(containerEl)
-            .setName('Claude API 키')
-            .setDesc('console.anthropic.com에서 발급')
-            .addText(t => t
-                .setPlaceholder('sk-ant-...')
-                .setValue(this.plugin.settings.claudeApiKey)
-                .onChange(async v => { this.plugin.settings.claudeApiKey = v.trim(); await this.plugin.saveSettings(); })
-            );
-
-        new obsidian.Setting(containerEl)
-            .setName('Claude 모델')
-            .addDropdown(dd => {
-                for (const m of MODELS.claude) dd.addOption(m.id, m.name);
-                dd.setValue(this.plugin.settings.claudeModel)
-                  .onChange(async v => { this.plugin.settings.claudeModel = v; await this.plugin.saveSettings(); this.display(); });
-            });
-
-        // ── Perplexity
-        containerEl.createEl('h3', { text: '🟣 Perplexity AI' });
-
-        new obsidian.Setting(containerEl)
-            .setName('Perplexity API 키')
-            .setDesc('perplexity.ai에서 발급')
-            .addText(t => t
-                .setPlaceholder('pplx-...')
-                .setValue(this.plugin.settings.perplexityApiKey)
-                .onChange(async v => { this.plugin.settings.perplexityApiKey = v.trim(); await this.plugin.saveSettings(); })
-            );
-
-        new obsidian.Setting(containerEl)
-            .setName('Perplexity 모델')
-            .addDropdown(dd => {
-                for (const m of MODELS.perplexity) dd.addOption(m.id, m.name);
-                dd.setValue(this.plugin.settings.perplexityModel)
-                  .onChange(async v => { this.plugin.settings.perplexityModel = v; await this.plugin.saveSettings(); this.display(); });
+                for (const m of models) dd.addOption(m.id, m.name);
+                dd.setValue(this.plugin.settings[modelKey])
+                  .onChange(async v => { this.plugin.settings[modelKey] = v; await this.plugin.saveSettings(); this.display(); });
             });
     }
 }
@@ -357,8 +668,8 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
     }
 
     getApiKey() {
-        const { provider, geminiApiKey, claudeApiKey, perplexityApiKey } = this.settings;
-        return { gemini: geminiApiKey, claude: claudeApiKey, perplexity: perplexityApiKey }[provider] || '';
+        const { provider, geminiApiKey, claudeApiKey, perplexityApiKey, openaiApiKey } = this.settings;
+        return { gemini: geminiApiKey, claude: claudeApiKey, perplexity: perplexityApiKey, openai: openaiApiKey }[provider] || '';
     }
 
     getCurrentModelName() {
@@ -390,7 +701,7 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
         return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
     }
 
-    async callClaude(prompt, apiKey, model) {
+    async callClaude(prompt, apiKey, model, compact) {
         const res = await fetch('https://api.anthropic.com/v1/messages', {
             method: 'POST',
             headers: {
@@ -400,7 +711,7 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             },
             body: JSON.stringify({
                 model,
-                max_tokens: 8192,
+                max_tokens: compact ? 100 : 8192,
                 messages: [{ role: 'user', content: prompt }],
             }),
         });
@@ -427,14 +738,34 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
         return data.choices?.[0]?.message?.content?.trim() || '';
     }
 
+    async callOpenAI(prompt, apiKey, model, compact) {
+        const res = await fetch('https://api.openai.com/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + apiKey,
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model,
+                messages: [{ role: 'user', content: prompt }],
+                max_tokens: compact ? 100 : 4096,
+                temperature: compact ? 0.2 : 0.7,
+            }),
+        });
+        const data = await res.json();
+        if (data.error) throw new Error('OpenAI: ' + data.error.message);
+        return data.choices?.[0]?.message?.content?.trim() || '';
+    }
+
     async callAPI(prompt, compact = false) {
-        const { provider, geminiModel, claudeModel, perplexityModel } = this.settings;
+        const { provider, geminiModel, claudeModel, perplexityModel, openaiModel } = this.settings;
         const apiKey = this.getApiKey();
         if (!apiKey) throw new Error(`${provider} API 키가 설정되지 않았습니다. 플러그인 설정(⚙️)에서 입력하세요.`);
 
-        if (provider === 'gemini') return this.callGemini(prompt, apiKey, geminiModel, compact);
-        if (provider === 'claude') return this.callClaude(prompt, apiKey, claudeModel);
+        if (provider === 'gemini')     return this.callGemini(prompt, apiKey, geminiModel, compact);
+        if (provider === 'claude')     return this.callClaude(prompt, apiKey, claudeModel, compact);
         if (provider === 'perplexity') return this.callPerplexity(prompt, apiKey, perplexityModel);
+        if (provider === 'openai')     return this.callOpenAI(prompt, apiKey, openaiModel, compact);
         throw new Error('알 수 없는 API 제공자');
     }
 
@@ -454,22 +785,13 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
         return new MemoPromptModal(this.app, title, placeholder, defaultVal).wait();
     }
 
-    multiSelect(items, title) {
-        return new MemoMultiSelectModal(this.app, items, title).wait();
-    }
-
     // ── Related Memo Discovery ─────────────────
 
     async findRelatedMemos(resultText, excludePaths) {
-        // Extract candidate keywords from AI result
         const words = (resultText.match(/[가-힣]{2,}|[a-zA-Z]{4,}/g) || []);
         const freq = {};
         for (const w of words) { const k = w.toLowerCase(); freq[k] = (freq[k] || 0) + 1; }
-
-        const topWords = Object.entries(freq)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 30)
-            .map(([w]) => w);
+        const topWords = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 30).map(([w]) => w);
 
         const excl = new Set(excludePaths);
         const related = [];
@@ -479,7 +801,6 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             const name = file.basename.toLowerCase();
             const cache = this.app.metadataCache.getFileCache(file);
             const tags = (cache?.tags || []).map(t => t.tag.toLowerCase());
-
             let score = 0;
             for (const w of topWords) {
                 if (name.includes(w)) score += 3;
@@ -487,16 +808,15 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             }
             if (score > 0) related.push({ file, score });
         }
-
         return related.sort((a, b) => b.score - a.score).slice(0, 8);
     }
 
-    // ── API Selection ──────────────────────────
+    // ── API 선택 후 실행 ─────────────────────────
 
     async runSynthesisWithApiSelect() {
         const providerChoice = await this.suggest(
-            ['🔵 Google Gemini', '🟠 Anthropic Claude', '🟣 Perplexity AI'],
-            ['gemini', 'claude', 'perplexity'],
+            ['🔵 Google Gemini', '🟠 Anthropic Claude', '🟣 Perplexity AI', '🟢 OpenAI'],
+            ['gemini', 'claude', 'perplexity', 'openai'],
             'AI 제공자 선택'
         );
         if (!providerChoice) return;
@@ -509,15 +829,13 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
         );
         if (!modelChoice) return;
 
-        // Temporarily override settings for this run
         const prevProvider = this.settings.provider;
         const prevModel = this.settings[providerChoice + 'Model'];
         this.settings.provider = providerChoice;
         this.settings[providerChoice + 'Model'] = modelChoice;
 
-        try {
-            await this.runSynthesis();
-        } finally {
+        try { await this.runSynthesis(); }
+        finally {
             this.settings.provider = prevProvider;
             this.settings[providerChoice + 'Model'] = prevModel;
         }
@@ -532,7 +850,7 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             return;
         }
 
-        const providerLabel = { gemini: 'Gemini', claude: 'Claude', perplexity: 'Perplexity' }[this.settings.provider];
+        const providerLabel = { gemini: 'Gemini', claude: 'Claude', perplexity: 'Perplexity', openai: 'OpenAI' }[this.settings.provider];
         new obsidian.Notice(`✅ ${providerLabel} — ${this.getCurrentModelName()}`, 2000);
 
         // ① 트리거 방식 선택
@@ -553,9 +871,9 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             topic = await this.prompt('주제 입력', '예: 푸코 권력, 감시사회, 관료제');
             if (!topic) { new obsidian.Notice('취소되었습니다.'); return; }
 
-        // ── 모드 2: 뉴스/텍스트 붙여넣기
+        // ── 모드 2: 뉴스/텍스트
         } else if (triggerMode === 'news') {
-            const pasted = await this.prompt('텍스트 붙여넣기', '뉴스, 논문 초록, 인용문 등을 붙여넣으세요 (Ctrl+Enter로 확인)');
+            const pasted = await this.prompt('텍스트 붙여넣기', '뉴스, 논문 초록, 인용문 등 (Ctrl+Enter로 확인)');
             if (!pasted) { new obsidian.Notice('❌ 텍스트가 없습니다.'); return; }
             seedContent = pasted;
 
@@ -574,11 +892,7 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             const allFiles = this.app.vault.getMarkdownFiles();
             if (!allFiles.length) { new obsidian.Notice('❌ 볼트에 메모가 없습니다.'); return; }
 
-            const chosen = await this.suggest(
-                allFiles.map(f => f.basename),
-                allFiles,
-                '메모를 선택하세요'
-            );
+            const chosen = await new MemoPickerModal(this.app, allFiles, '메모를 선택하세요', false).wait();
             if (!chosen) { new obsidian.Notice('❌ 메모를 선택하지 않았습니다.'); return; }
 
             const content = await this.app.vault.read(chosen);
@@ -586,20 +900,20 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             seedContent = content;
             topic = chosen.basename;
             skipSearch = true;
-            new obsidian.Notice(`📄 선택된 메모: ${topic}`);
+            new obsidian.Notice(`📄 선택됨: ${topic}`);
 
         // ── 모드 4: 메모 여러 개 → 주제 자동 추출
         } else if (triggerMode === 'multi_memo') {
             const allFiles = this.app.vault.getMarkdownFiles();
             if (!allFiles.length) { new obsidian.Notice('❌ 볼트에 메모가 없습니다.'); return; }
 
-            const picked = await this.multiSelect(allFiles.map(f => ({ file: f })), '메모 선택 (여러 개 선택 가능)');
+            const picked = await new MemoPickerModal(this.app, allFiles, '메모 선택 (여러 개 선택 가능)', true).wait();
             if (!picked.length) { new obsidian.Notice('❌ 메모를 선택하지 않았습니다.'); return; }
 
             const readResults = await Promise.all(
-                picked.map(async item => ({
-                    file: item.file,
-                    content: await this.app.vault.read(item.file),
+                picked.map(async file => ({
+                    file,
+                    content: await this.app.vault.read(file),
                     score: 0,
                 }))
             );
@@ -624,7 +938,7 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
 
         const keywords = topic.split(/[,\s]+/).filter(k => k.length > 1);
 
-        // ② 연관 메모 자동 검색 (text / news 모드만)
+        // ② 연관 메모 검색 (text / news 모드만)
         if (!skipSearch) {
             new obsidian.Notice('🔍 연관 메모를 검색 중...');
 
@@ -654,8 +968,12 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
             }
 
             // ③ 검색 결과에서 선택
-            const topFiles = scoredFiles.slice(0, 12);
-            const picked = await this.multiSelect(topFiles, `연관 메모 선택 (상위 ${topFiles.length}개)`);
+            const picked = await new MemoScoreSelectModal(
+                this.app,
+                scoredFiles.slice(0, 15),
+                `연관 메모 선택 (관련도순)`
+            ).wait();
+
             if (!picked.length) { new obsidian.Notice('❌ 메모를 선택하지 않았습니다.'); return; }
             selectedFiles = picked;
         }
@@ -669,34 +987,11 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
         if (!format) { new obsidian.Notice('취소되었습니다.'); return; }
 
         const formatPrompts = {
-            leet: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 LEET 언어이해 지문을 작성하세요.
-- 800~1000자 분량의 밀도 있는 학술 지문
-- 단일한 논지를 향해 논리적으로 전개
-- 지문 후 독해 문제 3개 포함 (선지 5개씩)
-- 생소한 개념도 지문 안에서 자연스럽게 정의`,
-
-            report: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 수사기획 보고서를 작성하세요.
-- 형식: 제목 / 개요 / 현황 및 문제점 / 원인 분석 / 개선방안 / 기대효과
-- 공문서 문체 사용, 항목화된 구조
-- 근거와 논리가 명확하게 드러나도록 작성`,
-
-            article: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 기고문을 작성하세요.
-- 전문 독자를 대상으로 한 깊이 있는 에세이
-- 도입부에서 문제의식 제시, 본론에서 논증, 결론에서 통찰 제시
-- 개인적 관점과 학문적 근거가 균형 있게 결합`,
-
-            synthesis: `다음 메모들의 핵심 개념들을 연결하고 발전시켜 '${topic}'에 관한 심화 메모를 작성하세요.
-- 각 메모 간의 공통점, 긴장관계, 상호보완 관계를 명시적으로 분석
-- 각 메모의 핵심 주장을 인용하며 새로운 종합적 관점 제시
-- 기존 메모에서 한 단계 더 나아간 새로운 통찰 제시
-- 추가로 탐구할 질문들도 포함
-- 메모 간 연결 관계를 명확히 서술 (예: "A 메모의 X 개념은 B 메모의 Y와 긴장 관계에 있으며...")`,
-
-            concept: `다음 메모들을 바탕으로 '${topic}'의 핵심 개념을 정리한 개념 노트를 작성하세요.
-- 핵심 개념 정의 및 계보
-- 주요 사상가 및 논점
-- 관련 개념들과의 관계도 (텍스트로 표현)
-- 실제 사례나 적용`,
+            leet: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 LEET 언어이해 지문을 작성하세요.\n- 800~1000자 분량의 밀도 있는 학술 지문\n- 단일한 논지를 향해 논리적으로 전개\n- 지문 후 독해 문제 3개 포함 (선지 5개씩)\n- 생소한 개념도 지문 안에서 자연스럽게 정의`,
+            report: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 수사기획 보고서를 작성하세요.\n- 형식: 제목 / 개요 / 현황 및 문제점 / 원인 분석 / 개선방안 / 기대효과\n- 공문서 문체 사용, 항목화된 구조\n- 근거와 논리가 명확하게 드러나도록 작성`,
+            article: `다음 메모들의 내용을 바탕으로 '${topic}' 주제의 기고문을 작성하세요.\n- 전문 독자를 대상으로 한 깊이 있는 에세이\n- 도입부에서 문제의식 제시, 본론에서 논증, 결론에서 통찰 제시\n- 개인적 관점과 학문적 근거가 균형 있게 결합`,
+            synthesis: `다음 메모들의 핵심 개념들을 연결하고 발전시켜 '${topic}'에 관한 심화 메모를 작성하세요.\n- 각 메모 간의 공통점, 긴장관계, 상호보완 관계를 명시적으로 분석\n- 각 메모의 핵심 주장을 인용하며 새로운 종합적 관점 제시\n- 기존 메모에서 한 단계 더 나아간 새로운 통찰 제시\n- 추가로 탐구할 질문들도 포함`,
+            concept: `다음 메모들을 바탕으로 '${topic}'의 핵심 개념을 정리한 개념 노트를 작성하세요.\n- 핵심 개념 정의 및 계보\n- 주요 사상가 및 논점\n- 관련 개념들과의 관계도 (텍스트로 표현)\n- 실제 사례나 적용`,
         };
 
         // ⑤ AI API 호출
@@ -726,14 +1021,12 @@ class MemoSynthesisPlugin extends obsidian.Plugin {
 
         // ⑦ 새 메모 생성
         const sourceLinks = selectedFiles.map(f => `[[${f.file.basename}]]`).join(', ');
-        const relatedLinks = relatedMemos.length > 0
-            ? relatedMemos.map(r => `[[${r.file.basename}]]`).join(', ')
-            : '';
+        const relatedLinks = relatedMemos.map(r => `[[${r.file.basename}]]`).join(', ');
 
         const now = new Date();
         const pad = n => String(n).padStart(2, '0');
-        const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-        const dateFile = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
+        const dateStr = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+        const dateFile = `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}`;
         const newFileName = `${topic}_${format}_${dateFile}`;
 
         const relatedSection = relatedMemos.length > 0
@@ -762,12 +1055,8 @@ ${relatedSection}
         try {
             await this.app.vault.create(newFileName + '.md', newContent);
             new obsidian.Notice(`✅ "${newFileName}" 생성 완료!`);
-
             const newFile = this.app.vault.getAbstractFileByPath(newFileName + '.md');
-            if (newFile) {
-                const leaf = this.app.workspace.getLeaf(false);
-                await leaf.openFile(newFile);
-            }
+            if (newFile) await this.app.workspace.getLeaf(false).openFile(newFile);
         } catch (e) {
             new obsidian.Notice('❌ 메모 생성 실패: ' + e.message);
         }
