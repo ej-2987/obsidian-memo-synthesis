@@ -1,0 +1,10 @@
+{
+  "id": "memo-synthesis",
+  "name": "메모 통합 발전",
+  "version": "1.0.0",
+  "minAppVersion": "0.15.0",
+  "description": "AI(Gemini, Claude, Perplexity)를 활용해 메모를 통합하고 발전시키는 플러그인",
+  "author": "memo-synthesis",
+  "authorUrl": "",
+  "isDesktopOnly": false
+}
